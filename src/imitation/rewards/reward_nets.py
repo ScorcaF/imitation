@@ -589,7 +589,7 @@ class RewardEnsemble(RewardNetWithVariance):
         self,
         observation_space: gym.Space,
         action_space: gym.Space,
-        num_members: int = 5,
+        num_members: int = 3,
         member_cls: Type[RewardNet] = BasicRewardNet,
         member_kwargs: Mapping[str, Any] = {},
         member_normalize_output_layer: Optional[Type[nn.Module]] = None,
