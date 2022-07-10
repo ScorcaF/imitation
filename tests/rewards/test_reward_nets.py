@@ -3,6 +3,8 @@
 import logging
 import numbers
 import os
+from typing import Tuple
+from unittest import mock
 
 import gym
 import numpy as np
@@ -27,6 +29,7 @@ DESERIALIZATION_TYPES = [
 REWARD_NETS = [
     reward_nets.BasicRewardNet,
     reward_nets.BasicShapedRewardNet,
+    reward_nets.RewardEnsemble,
 ]
 REWARD_NET_KWARGS = [
     {},
@@ -270,6 +273,116 @@ def test_potential_net_2d_obs():
     )
     rew_batch = net.predict(obs_b, action_b, next_obs_b, done_b)
     assert rew_batch.shape == (1,)
+
+
+@pytest.mark.parametrize("env_name", ENVS)
+@pytest.mark.parametrize("net_cls", REWARD_NETS)
+@pytest.mark.parametrize("num_members", [1, 2, 4])
+def test_reward_ensemble_creation(env_name, net_cls, num_members):
+    """A test RewardEnsemble constructor."""
+    env = gym.make(env_name)
+    ensemble = reward_nets.RewardEnsemble(
+        env.action_space,
+        env.observation_space,
+        num_members,
+        net_cls,
+    )
+    assert ensemble
+    assert ensemble.num_members == num_members
+    assert isinstance(ensemble.members[0], net_cls)
+
+
+class MockRewardNet(reward_nets.RewardNet):
+    """A mock reward net for testing."""
+
+    def __init__(
+        self,
+        observation_space: gym.Space,
+        action_space: gym.Space,
+        value: float = 0.0,
+    ):
+        """Create mock reward.
+
+        Args:
+            observation_space: observation space of the env
+            action_space: action space of the env
+            value: The reward to always return. Defaults to 0.0.
+        """
+        super().__init__(observation_space, action_space)
+        self.value = value
+
+    def forward(
+        self,
+        state: th.Tensor,
+        action: th.Tensor,
+        next_state: th.Tensor,
+        done: th.Tensor,
+    ) -> th.Tensor:
+        batch_size = state.shape[0]
+        return th.full(
+            (batch_size,),
+            fill_value=self.value,
+            dtype=th.float32,
+            device=state.device,
+        )
+
+
+@pytest.fixture
+def env_2d() -> Env2D:
+    """An instance of Env2d."""
+    return Env2D()
+
+
+@pytest.fixture
+def two_ensemble(env_2d) -> reward_nets.RewardEnsemble:
+    """A simple reward ensemble made up of two moke reward nets."""
+    return reward_nets.RewardEnsemble(
+        env_2d.observation_space,
+        env_2d.action_space,
+        num_members=2,
+        member_cls=MockRewardNet,
+    )
+
+
+@pytest.fixture
+def numpy_transitions() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """A batch of states, actions, next_states, and dones as np.ndarrays."""
+    return np.zeros((10, 5)), np.zeros((10, 1)), np.zeros((10, 5)), np.zeros((10,))
+
+
+def test_reward_ensemble_test_value_error(env_2d):
+    with pytest.raises(ValueError):
+        reward_nets.RewardEnsemble(
+            env_2d.action_space,
+            env_2d.observation_space,
+            num_members=0,
+        )
+
+
+def test_reward_ensemble_reward_moments(two_ensemble, numpy_transitions):
+    # Test that the calculation of mean and variance is correct
+    two_ensemble.members[0].value = 0
+    two_ensemble.members[1].value = 0
+    mean, var = two_ensemble.reward_moments(*numpy_transitions)
+    assert np.isclose(mean, 0).all()
+    assert np.isclose(var, 0).all()
+    two_ensemble.members[0].value = 3
+    two_ensemble.members[1].value = -1
+    mean, var = two_ensemble.reward_moments(*numpy_transitions)
+    assert np.isclose(mean, 1).all()
+    assert np.isclose(var, 8).all()  # note we are using the unbiased variance estimator
+    # Test that ensemble calls members correctly
+    two_ensemble.members[0].forward = mock.MagicMock(return_value=th.zeros(10))
+    mean, var = two_ensemble.reward_moments(*numpy_transitions)
+    two_ensemble.members[0].forward.assert_called_once()
+
+
+def test_conservative_reward_wrapper(two_ensemble, numpy_transitions):
+    two_ensemble.members[0].value = 3
+    two_ensemble.members[1].value = -1
+    conservative_reward = reward_nets.ConservativeRewardWrapper(two_ensemble, alpha=0.1)
+    rewards = conservative_reward.predict_processed(*numpy_transitions)
+    assert np.allclose(rewards, 1 - 0.1 * np.sqrt(8))
 
 
 @pytest.mark.parametrize("env_name", ENVS)

@@ -19,6 +19,7 @@ from stable_baselines3.common import (
     type_aliases,
     vec_env,
 )
+from torch import nn
 from tqdm.auto import tqdm
 
 from imitation.algorithms import base
@@ -662,6 +663,148 @@ def preference_collate_fn(
     return list(fragment_pairs), np.array(preferences)
 
 
+class RewardLoss(nn.Module, abc.ABC):
+    """A loss function over preferences."""
+
+    @abc.abstractmethod
+    def forward(
+        self,
+        model: reward_nets.RewardNet,
+        fragment_pairs: Sequence[TrajectoryPair],
+        preferences: np.ndarray,
+    ) -> Mapping[str, th.Tensor]:
+        """Computes the loss.
+
+        Args:
+            model: the reward network
+            fragment_pairs: Batch consisting of pairs of trajectory fragments.
+            preferences: The probability that the first fragment is preferred
+                over the second. Typically 0, 1 or 0.5 (tie).
+
+        Returns: # noqa: DAR202
+            loss: the loss
+            metrics: a dictionary of metrics that can be logged
+        """
+
+
+class CrossEntropyRewardLoss(RewardLoss):
+    """Compute the cross entropy reward loss."""
+
+    def __init__(
+        self,
+        noise_prob: float = 0.0,
+        discount_factor: float = 1.0,
+        threshold: float = 50,
+    ):
+        """Create cross entropy reward loss.
+
+        Args:
+            noise_prob: assumed probability with which the preference
+                is uniformly random (used for the model of preference generation
+                that is used for the loss)
+            discount_factor: the model of preference generation uses a softmax
+                of returns as the probability that a fragment is preferred.
+                This is the discount factor used to calculate those returns.
+                Default is 1, i.e. undiscounted sums of rewards (which is what
+                the DRLHP paper uses).
+            threshold: the preference model used to compute the loss contains
+                a softmax of returns. To avoid overflows, we clip differences
+                in returns that are above this threshold. This threshold
+                is therefore in logspace. The default value of 50 means
+                that probabilities below 2e-22 are rounded up to 2e-22.
+        """
+        super().__init__()
+        self.discount_factor = discount_factor
+        self.noise_prob = noise_prob
+        self.threshold = threshold
+
+    def forward(
+        self,
+        model: reward_nets.RewardNet,
+        fragment_pairs: Sequence[TrajectoryPair],
+        preferences: np.ndarray,
+    ) -> Mapping[str, Any]:
+        """Computes the loss.
+
+        Args:
+            model: the reward network to call
+            fragment_pairs: Batch consisting of pairs of trajectory fragments.
+            preferences: The probability that the first fragment is preferred
+                over the second. Typically 0, 1 or 0.5 (tie).
+
+        Returns:
+            loss: The cross-entropy loss between the probability predicted by the
+                reward model and the target probabilities in `preferences`.
+            metrics:
+                accuracy: as a th.Tensor
+        """
+        probs = th.empty(len(fragment_pairs), dtype=th.float32)
+        for i, fragment in enumerate(fragment_pairs):
+            frag1, frag2 = fragment
+            trans1 = rollout.flatten_trajectories([frag1])
+            trans2 = rollout.flatten_trajectories([frag2])
+            rews1 = self._rewards(model, trans1)
+            rews2 = self._rewards(model, trans2)
+            probs[i] = self._probability(rews1, rews2)
+        # TODO(ejnnr): Here and below, > 0.5 is problematic
+        # because getting exactly 0.5 is actually somewhat
+        # common in some environments (as long as sample=False or temperature=0).
+        # In a sense that "only" creates class imbalance
+        # but it's still misleading.
+        predictions = (probs > 0.5).float()
+        preferences_th = th.as_tensor(preferences, dtype=th.float32)
+        ground_truth = (preferences_th > 0.5).float()
+        accuracy = (predictions == ground_truth).float().mean()
+        return {
+            "loss": th.nn.functional.binary_cross_entropy(probs, preferences_th),
+            "metrics": {"accuracy": accuracy.detach().cpu()},
+        }
+
+    def _rewards(
+        self,
+        model: reward_nets.RewardNet,
+        transitions: Transitions,
+    ) -> th.Tensor:
+        preprocessed = model.preprocess(
+            state=transitions.obs,
+            action=transitions.acts,
+            next_state=transitions.next_obs,
+            done=transitions.dones,
+        )
+        return model(*preprocessed)
+
+    def _probability(self, rews1: th.Tensor, rews2: th.Tensor) -> th.Tensor:
+        """Computes the Boltzmann rational probability that the first trajectory is best.
+
+        Args:
+            rews1: A 1-dimensional array of rewards for the first trajectory fragment.
+            rews2: A 1-dimensional array of rewards for the second trajectory fragment.
+
+        Returns:
+            The softmax of the difference between the (discounted) return of the
+            first and second trajectory.
+        """
+        # TODO(lev) this could be extracted into its own class.
+        assert rews1.ndim == rews2.ndim == 1
+        # First, we compute the difference of the returns of
+        # the two fragments. We have a special case for a discount
+        # factor of 1 to avoid unnecessary computation (especially
+        # since this is the default setting).
+        if self.discount_factor == 1:
+            returns_diff = (rews2 - rews1).sum()
+        else:
+            discounts = self.discount_factor ** th.arange(len(rews1))
+            returns_diff = (discounts * (rews2 - rews1)).sum()
+        # Clip to avoid overflows (which in particular may occur
+        # in the backwards pass even if they do not in the forward pass).
+        returns_diff = th.clip(returns_diff, -self.threshold, self.threshold)
+        # We take the softmax of the returns. model_probability
+        # is the first dimension of that softmax, representing the
+        # probability that fragment 1 is preferred.
+        model_probability = 1 / (1 + returns_diff.exp())
+        return self.noise_prob * 0.5 + (1 - self.noise_prob) * model_probability
+
+
 class RewardTrainer(abc.ABC):
     """Abstract base class for training reward models using preference comparisons.
 
@@ -700,18 +843,16 @@ class RewardTrainer(abc.ABC):
         """Train the reward model; see ``train`` for details."""
 
 
-class CrossEntropyRewardTrainer(RewardTrainer):
-    """Train a reward model using a cross entropy loss."""
+class BasicRewardTrainer(RewardTrainer):
+    """Train a basic reward model."""
 
     def __init__(
         self,
         model: reward_nets.RewardNet,
-        noise_prob: float = 0.0,
+        loss: RewardLoss,
         batch_size: int = 32,
         epochs: int = 1,
         lr: float = 1e-3,
-        discount_factor: float = 1.0,
-        threshold: float = 50,
         weight_decay: float = 0.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
     ):
@@ -719,137 +860,132 @@ class CrossEntropyRewardTrainer(RewardTrainer):
 
         Args:
             model: the RewardNet instance to be trained
-            noise_prob: assumed probability with which the preference
-                is uniformly random (used for the model of preference generation
-                that is used for the loss)
+            loss: the loss to use
             batch_size: number of fragment pairs per batch
             epochs: number of epochs on each training iteration (can be adjusted
                 on the fly by specifying an `epoch_multiplier` in `self.train()`
                 if longer training is desired in specific cases).
             lr: the learning rate
-            discount_factor: the model of preference generation uses a softmax
-                of returns as the probability that a fragment is preferred.
-                This is the discount factor used to calculate those returns.
-                Default is 1, i.e. undiscounted sums of rewards (which is what
-                the DRLHP paper uses).
-            threshold: the preference model used to compute the loss contains
-                a softmax of returns. To avoid overflows, we clip differences
-                in returns that are above this threshold. This threshold
-                is therefore in logspace. The default value of 50 means
-                that probabilities below 2e-22 are rounded up to 2e-22.
             weight_decay: the weight decay factor for the reward model's weights
                 to use with ``th.optim.AdamW``. This is similar to but not equivalent
                 to L2 regularization, see https://arxiv.org/abs/1711.05101
             custom_logger: Where to log to; if None (default), creates a new logger.
         """
         super().__init__(model, custom_logger)
-        self.noise_prob = noise_prob
+        self.loss = loss
         self.batch_size = batch_size
         self.epochs = epochs
-        self.discount_factor = discount_factor
-        self.threshold = threshold
         self.optim = th.optim.AdamW(
             self.model.parameters(),
             lr=lr,
             weight_decay=weight_decay,
         )
 
-    def _loss(
-        self,
-        fragment_pairs: Sequence[TrajectoryPair],
-        preferences: np.ndarray,
-    ) -> th.Tensor:
-        """Computes the loss.
-
-        Args:
-            fragment_pairs: Batch consisting of pairs of trajectory fragments.
-            preferences: The probability that the first fragment is preferred
-                over the second. Typically 0, 1 or 0.5 (tie).
-
-        Returns:
-            The cross-entropy loss between the probability predicted by the
-            reward model and the target probabilities in `preferences`.
-        """
-        probs = th.empty(len(fragment_pairs), dtype=th.float32)
-        for i, fragment in enumerate(fragment_pairs):
-            frag1, frag2 = fragment
-            trans1 = rollout.flatten_trajectories([frag1])
-            trans2 = rollout.flatten_trajectories([frag2])
-            rews1 = self._rewards(trans1)
-            rews2 = self._rewards(trans2)
-            probs[i] = self._probability(rews1, rews2)
-        # TODO(ejnnr): Here and below, > 0.5 is problematic
-        # because getting exactly 0.5 is actually somewhat
-        # common in some environments (as long as sample=False or temperature=0).
-        # In a sense that "only" creates class imbalance
-        # but it's still misleading.
-        predictions = (probs > 0.5).float()
-        preferences_th = th.as_tensor(preferences, dtype=th.float32)
-        ground_truth = (preferences_th > 0.5).float()
-        accuracy = (predictions == ground_truth).float().mean()
-        self.logger.record("accuracy", accuracy.item())
-        return th.nn.functional.binary_cross_entropy(probs, preferences_th)
-
-    def _rewards(self, transitions: Transitions) -> th.Tensor:
-        preprocessed = self.model.preprocess(
-            state=transitions.obs,
-            action=transitions.acts,
-            next_state=transitions.next_obs,
-            done=transitions.dones,
-        )
-        return self.model(*preprocessed)
-
-    def _probability(self, rews1: th.Tensor, rews2: th.Tensor) -> th.Tensor:
-        """Computes the Boltzmann rational probability that the first trajectory is best.
-
-        Args:
-            rews1: A 1-dimensional array of rewards for the first trajectory fragment.
-            rews2: A 1-dimensional array of rewards for the second trajectory fragment.
-
-        Returns:
-            The softmax of the difference between the (discounted) return of the
-            first and second trajectory.
-        """
-        assert rews1.ndim == rews2.ndim == 1
-        # First, we compute the difference of the returns of
-        # the two fragments. We have a special case for a discount
-        # factor of 1 to avoid unnecessary computation (especially
-        # since this is the default setting).
-        if self.discount_factor == 1:
-            returns_diff = (rews2 - rews1).sum()
-        else:
-            discounts = self.discount_factor ** th.arange(len(rews1))
-            returns_diff = (discounts * (rews2 - rews1)).sum()
-        # Clip to avoid overflows (which in particular may occur
-        # in the backwards pass even if they do not in the forward pass).
-        returns_diff = th.clip(returns_diff, -self.threshold, self.threshold)
-        # We take the softmax of the returns. model_probability
-        # is the first dimension of that softmax, representing the
-        # probability that fragment 1 is preferred.
-        model_probability = 1 / (1 + returns_diff.exp())
-        return self.noise_prob * 0.5 + (1 - self.noise_prob) * model_probability
-
-    def _train(self, dataset: PreferenceDataset, epoch_multiplier: float = 1.0):
-        """Trains for `epoch_multiplier * self.epochs` epochs over `dataset`."""
-        # TODO(ejnnr): This isn't specific to the loss function or probability model.
-        # In general, it might be best to split the probability model, the loss and
-        # the optimization procedure a bit more cleanly so that different versions
-        # can be combined
-        dataloader = th.utils.data.DataLoader(
+    def _make_data_loader(self, dataset: PreferenceDataset):
+        """Make a dataloader."""
+        return th.utils.data.DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=True,
             collate_fn=preference_collate_fn,
         )
+
+    def _train(self, dataset: PreferenceDataset, epoch_multiplier: float = 1.0):
+        """Trains for `epoch_multiplier * self.epochs` epochs over `dataset`."""
+        dataloader = self._make_data_loader(dataset)
         epochs = round(self.epochs * epoch_multiplier)
 
         for _ in tqdm(range(epochs), desc="Training reward model"):
             for fragment_pairs, preferences in dataloader:
                 self.optim.zero_grad()
-                loss = self._loss(fragment_pairs, preferences)
+                output = self.loss(self.model, fragment_pairs, preferences)
+                loss = output["loss"]
                 loss.backward()
                 self.optim.step()
                 self.logger.record("loss", loss.item())
+                for metric in output["metrics"]:
+                    self.logger.record(metric, output["metrics"][metric])
+
+
+class RewardEnsembleTrainer(BasicRewardTrainer):
+    """Train a reward ensemble."""
+
+    model: reward_nets.RewardEnsemble
+
+    def __init__(
+        self,
+        model: reward_nets.RewardEnsemble,
+        loss: RewardLoss,
+        batch_size: int = 32,
+        epochs: int = 1,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        """Create an ensemble trainer."""
+        super().__init__(
+            model,
+            loss,
+            batch_size,
+            epochs,
+            lr,
+            weight_decay,
+            custom_logger,
+        )
+
+    def _train(self, dataset: PreferenceDataset, epoch_multiplier: float = 1.0):
+        """Trains for `epoch_multiplier * self.epochs` epochs over `dataset`."""
+        dataloader = self._make_data_loader(dataset)
+        epochs = round(self.epochs * epoch_multiplier)
+
+        for _ in tqdm(range(epochs), desc="Training reward model"):
+            for fragment_pairs, preferences in dataloader:
+                self.optim.zero_grad()
+                losses = []
+                metrics = []
+                for member in self.model.members:
+                    output = self.loss(member, fragment_pairs, preferences)
+                    losses.append(output["loss"])
+                    metrics.append(output["metrics"])
+                losses = th.stack(losses)
+                loss = losses.mean()
+                loss.backward()
+                self.optim.step()
+
+                # Note here we are return all the losses not just the mean
+                # This will give us a histogram
+                self.logger.record("loss", loss.item())
+                self.logger.record("dist_loss", losses.detach().cpu().numpy())
+                # Turn metrics from a list of dictionaries into a dictionary of
+                # tensors. Again this should give us a histogram in tensorboard.
+                metrics = {k: th.stack([di[k] for di in metrics]) for k in metrics[0]}
+                for metric in metrics:
+                    self.logger.record(metric, metrics[metric].mean().item())
+                    self.logger.record(f"dist_{metric}", metrics[metric].cpu().numpy())
+
+
+def make_reward_trainer(
+    reward_model: reward_nets.RewardNet,
+    loss: RewardLoss,
+    reward_trainer_kwargs: Mapping[str, Any] = {},
+) -> RewardTrainer:
+    """Construct the correct type of reward trainer for this reward function."""
+    base_model = reward_model
+    while hasattr(base_model, "base"):
+        base_model = base_model.base
+
+    if isinstance(base_model, reward_nets.RewardEnsemble):
+        return RewardEnsembleTrainer(
+            base_model,
+            loss,
+            **reward_trainer_kwargs,
+        )
+    else:
+        return BasicRewardTrainer(
+            reward_model,
+            loss=loss,
+            **reward_trainer_kwargs,
+        )
 
 
 QUERY_SCHEDULES: Dict[str, type_aliases.Schedule] = {
@@ -959,16 +1095,23 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         self._iteration = 0
 
         self.model = reward_model
-        self.reward_trainer = reward_trainer or CrossEntropyRewardTrainer(
-            reward_model,
-            custom_logger=self.logger,
-        )
+
+        if reward_trainer is None:
+            loss = CrossEntropyRewardLoss()
+            self.reward_trainer = make_reward_trainer(reward_model, loss)
+        else:
+            self.reward_trainer = reward_trainer
+
         # If the reward trainer was created in the previous line, we've already passed
         # the correct logger. But if the user created a RewardTrainer themselves and
         # didn't manually set a logger, it would be annoying if a separate one was used.
         self.reward_trainer.logger = self.logger
         # the reward_trainer's model should refer to the same object as our copy
-        assert self.reward_trainer.model is self.model
+        # the only exception to this is when we are using a wrapped reward ensemble
+        assert self.reward_trainer.model is self.model or isinstance(
+            self.reward_trainer.model,
+            reward_nets.RewardEnsemble,
+        )
         self.trajectory_generator = trajectory_generator
         self.trajectory_generator_num_steps = 0
         self.trajectory_generator.logger = self.logger
