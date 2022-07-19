@@ -134,7 +134,7 @@ def train_rl(
                 policy_save_interval,
                 save_video_callback,
             )
-        callback_objs.append(save_video_callback)
+            callback_objs.append(save_video_callback)
     callback = callbacks.CallbackList(callback_objs)
 
     if agent_path is None:
