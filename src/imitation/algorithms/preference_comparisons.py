@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch as th
+from torch.utils.data import random_split
 from scipy import special
 from stable_baselines3.common import base_class, type_aliases, vec_env
 from tqdm.auto import tqdm
@@ -691,8 +692,9 @@ class CrossEntropyRewardTrainer(RewardTrainer):
         lr: float = 1e-3,
         discount_factor: float = 1.0,
         threshold: float = 50,
-        weight_decay: float = 0.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+        reg_init_coef: Optional[float] = None,
+        reg_val_split: float = 0.2,
     ):
         """Initialize the reward model trainer.
 
@@ -716,10 +718,13 @@ class CrossEntropyRewardTrainer(RewardTrainer):
                 in returns that are above this threshold. This threshold
                 is therefore in logspace. The default value of 50 means
                 that probabilities below 2e-22 are rounded up to 2e-22.
-            weight_decay: the weight decay factor for the reward model's weights
-                to use with ``th.optim.AdamW``. This is similar to but not equivalent
-                to L2 regularization, see https://arxiv.org/abs/1711.05101
             custom_logger: Where to log to; if None (default), creates a new logger.
+            reg_init_coef: initial value of the L2 regularization coefficient.
+                If None (default), no regularization is used.
+            reg_val_split: fraction of the training data to use for
+                training the regularization coefficient as a validation set.
+                The rest of the data is used for training the model.
+                Only used if `reg_init_coef` is not None.
         """
         super().__init__(model, custom_logger)
         self.noise_prob = noise_prob
@@ -730,8 +735,10 @@ class CrossEntropyRewardTrainer(RewardTrainer):
         self.optim = th.optim.AdamW(
             self.model.parameters(),
             lr=lr,
-            weight_decay=weight_decay,
         )
+        self.reg_coef = th.tensor(reg_init_coef, requires_grad=True) \
+            if reg_init_coef is not None else None
+        self.reg_val_split = reg_val_split
 
     def _loss(
         self,
@@ -758,16 +765,28 @@ class CrossEntropyRewardTrainer(RewardTrainer):
             rews2 = self._rewards(trans2)
             probs[i] = self._probability(rews1, rews2)
         # TODO(ejnnr): Here and below, > 0.5 is problematic
-        # because getting exactly 0.5 is actually somewhat
-        # common in some environments (as long as sample=False or temperature=0).
-        # In a sense that "only" creates class imbalance
-        # but it's still misleading.
+        #  because getting exactly 0.5 is actually somewhat
+        #  common in some environments (as long as sample=False or temperature=0).
+        #  In a sense that "only" creates class imbalance
+        #  but it's still misleading.
         predictions = (probs > 0.5).float()
         preferences_th = th.as_tensor(preferences, dtype=th.float32)
         ground_truth = (preferences_th > 0.5).float()
         accuracy = (predictions == ground_truth).float().mean()
         self.logger.record("accuracy", accuracy.item())
-        return th.nn.functional.binary_cross_entropy(probs, preferences_th)
+
+        reg_loss = 0
+        if self.reg_coef is not None:
+            for param in self.model.parameters():
+                reg_loss += th.linalg.norm(param, ord=2) ** 2
+            reg_loss = self.reg_coef * reg_loss
+
+        return th.nn.functional.binary_cross_entropy(probs, preferences_th) + reg_loss
+
+    @property
+    def using_reg(self) -> bool:
+        """Whether regularization is used."""
+        return self.reg_coef is not None
 
     def _rewards(self, transitions: Transitions) -> th.Tensor:
         preprocessed = self.model.preprocess(
@@ -811,24 +830,47 @@ class CrossEntropyRewardTrainer(RewardTrainer):
     def _train(self, dataset: PreferenceDataset, epoch_multiplier: float = 1.0):
         """Trains for `epoch_multiplier * self.epochs` epochs over `dataset`."""
         # TODO(ejnnr): This isn't specific to the loss function or probability model.
-        # In general, it might be best to split the probability model, the loss and
-        # the optimization procedure a bit more cleanly so that different versions
-        # can be combined
-        dataloader = th.utils.data.DataLoader(
-            dataset,
+        #  In general, it might be best to split the probability model, the loss and
+        #  the optimization procedure a bit more cleanly so that different versions
+        #  can be combined
+
+        train_dataset, val_dataset = None, None
+        if self.using_reg:
+            dataset_len = len(dataset)
+            val_len = int(dataset_len * self.reg_val_split)
+            train_len = dataset_len - val_len
+            train_dataset, val_dataset = random_split(
+                dataset, [train_len, val_len],
+                generator=th.Generator().manual_seed(42))  # TODO(juan): allow specifying a seed if desired
+
+        train_dataloader = th.utils.data.DataLoader(
+            train_dataset if self.using_reg else dataset,
             batch_size=self.batch_size,
             shuffle=True,
             collate_fn=preference_collate_fn,
         )
+
+        val_dataloader = th.utils.data.DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=preference_collate_fn,
+        ) if self.using_reg else None
+
         epochs = round(self.epochs * epoch_multiplier)
 
         for _ in tqdm(range(epochs), desc="Training reward model"):
-            for fragment_pairs, preferences in dataloader:
+            for fragment_pairs, preferences in train_dataloader:
                 self.optim.zero_grad()
                 loss = self._loss(fragment_pairs, preferences)
                 loss.backward()
                 self.optim.step()
                 self.logger.record("loss", loss.item())
+
+            for fragment_pairs, preferences in val_dataloader:
+                # TODO(juan) compute here validation loss, update self.reg_coef
+                pass
+
 
 
 QUERY_SCHEDULES: Dict[str, type_aliases.Schedule] = {
