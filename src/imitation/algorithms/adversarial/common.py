@@ -378,7 +378,8 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             total_timesteps = self.gen_train_timesteps
         if learn_kwargs is None:
             learn_kwargs = {}
-
+            
+ ######################## CHANGE FREE MODEL BASED TO MODEL BASED ########################################################
         with self.logger.accumulate_means("gen"):
             self.gen_algo.learn(
                 total_timesteps=total_timesteps,
@@ -387,6 +388,8 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
                 **learn_kwargs,
             )
             self._global_step += 1
+            
+ ######################## CHANGE FREE MODEL BASED TO MODEL BASED ########################################################
 
         gen_trajs, ep_lens = self.venv_buffering.pop_trajectories()
         self._check_fixed_horizon(ep_lens)
