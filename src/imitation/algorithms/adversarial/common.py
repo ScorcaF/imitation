@@ -19,6 +19,16 @@ from imitation.data import buffer, rollout, types, wrappers
 from imitation.rewards import reward_nets, reward_wrapper
 from imitation.util import logger, networks, util
 
+import omegaconf
+import mbrl.env.reward_fns as reward_fns
+import mbrl.env.termination_fns as termination_fns
+import mbrl.models as models
+import mbrl.planning as planning
+import mbrl.util.common as common_util
+import mbrl.util as util
+
+
+
 
 def compute_train_stats(
     disc_logits_expert_is_high: th.Tensor,
@@ -109,7 +119,7 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         demonstrations: base.AnyTransitions,
         demo_batch_size: int,
         venv: vec_env.VecEnv,
-        gen_algo: base_class.BaseAlgorithm,
+#         gen_algo: base_class.BaseAlgorithm,
         reward_net: reward_nets.RewardNet,
         n_disc_updates_per_round: int = 2,
         log_dir: str = "output/",
@@ -122,6 +132,13 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         init_tensorboard_graph: bool = False,
         debug_use_ground_truth: bool = False,
         allow_variable_horizon: bool = False,
+        
+        gen_algo,        
+        dynamics_model,
+        cfg,
+        replay_buffer,
+        model_trainer
+        
     ):
         """Builds AdversarialTrainer.
 
@@ -237,6 +254,11 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             gen_replay_buffer_capacity,
             self.venv,
         )
+        ###################### new variables #############################
+        self.dynamics_model = dynamics_model
+        self.cfg = cfg
+        self.replay_buffer = replay_buffer
+        self.model_trainer = model_trarine
 
     @property
     def policy(self) -> policies.BasePolicy:
@@ -380,16 +402,62 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             learn_kwargs = {}
             
  ######################## CHANGE FREE MODEL BASED TO MODEL BASED ########################################################
-        with self.logger.accumulate_means("gen"):
-            self.gen_algo.learn(
-                total_timesteps=total_timesteps,
-                reset_num_timesteps=False,
-                callback=self.gen_callback,
-                **learn_kwargs,
-            )
-            self._global_step += 1
+#         with self.logger.accumulate_means("gen"):
+#             self.gen_algo.learn(
+#                 total_timesteps=total_timesteps,
+#                 reset_num_timesteps=False,
+#                 callback=self.gen_callback,
+#                 **learn_kwargs,
+#             )
+#             self._global_step += 1
             
- ######################## CHANGE FREE MODEL BASED TO MODEL BASED ########################################################
+            # Main PETS loop
+            all_rewards = [0]
+            for trial in range(2):
+                obs = self.venv_train.reset()    
+                self.gen_algo.reset()
+
+                done = False
+                total_reward = 0.0
+                steps_trial = 0
+                
+                while not done:
+                    # --------------- Model Training -----------------
+                    if steps_trial == 0:
+                        self.dynamics_model.update_normalizer(self.replay_buffer.get_all())  # update normalizer stats --> all the input arrays must have same number of dimensions, but the array at index 0 has 4 dimension(s) and the array at index 1 has 2 dimension(s)
+
+                        dataset_train, dataset_val = common_util.get_basic_buffer_iterators(
+                            self.replay_buffer,
+                            batch_size=cfg.overrides.model_batch_size,
+                            val_ratio=cfg.overrides.validation_ratio,
+                            ensemble_size=ensemble_size,
+                            shuffle_each_epoch=True,
+                            bootstrap_permutes=False,  # build bootstrap dataset using sampling with replacement
+                        )
+
+                        self.model_trainer.train(
+                            dataset_train, 
+                            dataset_val=dataset_val, 
+                            num_epochs=2, 
+                            patience=2
+                        )
+
+                    # --- Doing env step using the agent and adding to model dataset ---
+                    next_obs, reward, done, _ = common_util.step_env_and_add_to_buffer(
+                        self.venv_train, obs, self.gen_algo, {}, self.replay_buffer)
+
+                    
+
+                    obs = next_obs
+                    total_reward += reward
+                    steps_trial += 1
+
+                    if steps_trial == trial_length:
+                        break
+
+                all_rewards.append(total_reward)
+
+ ######################## ###################################### ########################################################
 
         gen_trajs, ep_lens = self.venv_buffering.pop_trajectories()
         self._check_fixed_horizon(ep_lens)
