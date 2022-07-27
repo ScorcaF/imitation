@@ -25,7 +25,6 @@ import mbrl.env.termination_fns as termination_fns
 import mbrl.models as models
 import mbrl.planning as planning
 import mbrl.util.common as common_util
-import mbrl.util as util
 
 
 
@@ -236,17 +235,29 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             self.gen_callback = self.venv_wrapped.make_log_callback()
         self.venv_train = self.venv_wrapped
 
-        self.gen_algo.set_env(self.venv_train)
-        self.gen_algo.set_logger(self.logger)
+#######################################################################
+        # In train_gen() the step is performed on self.venv_train
+        # self.gen_algo.set_env(self.venv_train) 
 
-        if gen_train_timesteps is None:
-            gen_algo_env = self.gen_algo.get_env()
-            assert gen_algo_env is not None
-            self.gen_train_timesteps = gen_algo_env.num_envs
-            if hasattr(self.gen_algo, "n_steps"):  # on policy
-                self.gen_train_timesteps *= self.gen_algo.n_steps
-        else:
-            self.gen_train_timesteps = gen_train_timesteps
+
+        # 'TrajectoryOptimizerAgent' object has no attribute 'set_logger' 
+        # self.gen_algo.set_logger(self.logger)       
+
+
+        # 'TrajectoryOptimizerAgent' object has no attribute 'get_env'
+
+        # if gen_train_timesteps is None:
+        #     gen_algo_env = self.gen_algo.get_env()
+        #     assert gen_algo_env is not None
+        #     self.gen_train_timesteps = gen_algo_env.num_envs
+        #     if hasattr(self.gen_algo, "n_steps"):  # on policy
+        #         self.gen_train_timesteps *= self.gen_algo.n_steps
+        # else:
+        #     self.gen_train_timesteps = gen_train_timesteps
+        
+        self.gen_train_timesteps = gen_train_timesteps
+#######################################################################
+
 
         if gen_replay_buffer_capacity is None:
             gen_replay_buffer_capacity = self.gen_train_timesteps
@@ -258,7 +269,8 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         self.dynamics_model = dynamics_model
         self.cfg = cfg
         self.replay_buffer = replay_buffer
-        self.model_trainer = model_trarine
+        self.model_trainer = model_trainer
+        self.ensemble_size = 1
 
     @property
     def policy(self) -> policies.BasePolicy:
@@ -428,9 +440,9 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
 
                         dataset_train, dataset_val = common_util.get_basic_buffer_iterators(
                             self.replay_buffer,
-                            batch_size=cfg.overrides.model_batch_size,
-                            val_ratio=cfg.overrides.validation_ratio,
-                            ensemble_size=ensemble_size,
+                            batch_size=self.cfg.overrides.model_batch_size,
+                            val_ratio=self.cfg.overrides.validation_ratio,
+                            ensemble_size=self.ensemble_size,
                             shuffle_each_epoch=True,
                             bootstrap_permutes=False,  # build bootstrap dataset using sampling with replacement
                         )
