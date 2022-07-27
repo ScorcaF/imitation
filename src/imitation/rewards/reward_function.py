@@ -1,7 +1,7 @@
 """Type alias shared by reward-related code."""
 
 import abc
-from typing import Protocol
+from typing_extensions import Protocol
 
 import numpy as np
 
