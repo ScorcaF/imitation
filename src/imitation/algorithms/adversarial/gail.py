@@ -120,7 +120,7 @@ class GAIL(common.AdversarialTrainer):
             **kwargs: Passed through to `AdversarialTrainer.__init__`.
         """
         # Raw self._reward_net is discriminator logits
-        reward_net = reward_net.to(gen_algo.device)
+#         reward_net = reward_net.to(gen_algo.device)-------------------------------------------
         # Process it to produce output suitable for RL training
         # Applies a -log(sigmoid(-logits)) to the logits (see class for explanation)
         self._processed_reward = RewardNetFromDiscriminatorLogit(reward_net)
