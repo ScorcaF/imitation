@@ -1,6 +1,6 @@
 """Generative Adversarial Imitation Learning (GAIL)."""
 
-from typing import Optional
+from typing_extensions import Optional
 
 import torch as th
 from stable_baselines3.common import base_class
