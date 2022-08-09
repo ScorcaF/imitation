@@ -4,7 +4,7 @@ import collections
 import dataclasses
 import logging
 import os
-from typing import Callable, Mapping, Optional, Sequence, Tuple, Type
+from typing import Callable, Mapping, Optional, Sequence, Tuple, Type, cast
 
 import numpy as np
 import torch as th
@@ -25,6 +25,10 @@ import mbrl.env.termination_fns as termination_fns
 import mbrl.models as models
 import mbrl.planning as planning
 import mbrl.util.common as common_util
+
+import mbrl.util as mbrl_util
+from mbrl import constants
+import mbrl.types as mbrl_types
 
 
 
@@ -136,7 +140,9 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         dynamics_model,
         cfg,
         replay_buffer,
-        model_trainer
+        model_trainer,
+        term_fn,
+        torch_generator
         
     ):
         """Builds AdversarialTrainer.
@@ -274,6 +280,9 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         self.replay_buffer = replay_buffer
         self.model_trainer = model_trainer
         self.ensemble_size = 1
+        self.term_fn = term_fn
+        self.torch_generator= torch_generator
+        self.work_dir = os.getcwd()
 
     @property
     def policy(self) -> policies.BasePolicy:
@@ -393,7 +402,83 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
                 self._summary_writer.add_histogram("disc_logits", disc_logits.detach())
 
         return train_stats
+#################################################################################################
+    def rollout_model_and_populate_sac_buffer(self,
+        model_env: models.ModelEnv,
+        replay_buffer: mbrl_util.ReplayBuffer,
+        agent,
+        sac_buffer: mbrl_util.ReplayBuffer,
+        sac_samples_action: bool,
+        rollout_horizon: int,
+        batch_size: int,
+    ):
 
+        batch = replay_buffer.sample(batch_size)
+        initial_obs, *_ = cast(mbrl_types.TransitionBatch, batch).astuple()
+        model_state = model_env.reset(
+            initial_obs_batch=cast(np.ndarray, initial_obs),
+            return_as_np=True,
+        )
+        accum_dones = np.zeros(initial_obs.shape[0], dtype=bool)
+        obs = initial_obs
+        for i in range(rollout_horizon):
+            action = agent.act(obs, sample=sac_samples_action, batched=True)
+            pred_next_obs, pred_rewards, pred_dones, model_state = model_env.step(
+                action, model_state, sample=True
+            )
+            sac_buffer.add_batch(
+                obs[~accum_dones],
+                action[~accum_dones],
+                pred_next_obs[~accum_dones],
+                pred_rewards[~accum_dones, 0],
+                pred_dones[~accum_dones, 0],
+            )
+            obs = pred_next_obs
+            accum_dones |= pred_dones.squeeze()
+
+
+    def evaluate(self,
+        env,
+        agent,
+        num_episodes: int,
+        video_recorder,
+    ) -> float:
+        avg_episode_reward = 0
+        for episode in range(num_episodes):
+            obs = env.reset()
+            video_recorder.init(enabled=(episode == 0))
+            done = False
+            episode_reward = 0
+            while not done:
+                action = agent.act(obs)
+                obs, reward, done, _ = env.step(action)
+                video_recorder.record(env)
+                episode_reward += reward
+            avg_episode_reward += episode_reward
+        return avg_episode_reward / num_episodes
+
+
+    def maybe_replace_sac_buffer(self,
+        sac_buffer: Optional[mbrl_util.ReplayBuffer],
+        obs_shape: Sequence[int],
+        act_shape: Sequence[int],
+        new_capacity: int,
+        seed: int,
+    ) -> mbrl_util.ReplayBuffer:
+        if sac_buffer is None or new_capacity != sac_buffer.capacity:
+            if sac_buffer is None:
+                rng = np.random.default_rng(seed=seed)
+            else:
+                rng = sac_buffer.rng
+            new_buffer = mbrl_util.ReplayBuffer(new_capacity, obs_shape, act_shape, rng=rng)
+            if sac_buffer is None:
+                return new_buffer
+            obs, action, next_obs, reward, done = sac_buffer.get_all().astuple()
+            new_buffer.add_batch(obs, action, next_obs, reward, done)
+            return new_buffer
+        return sac_buffer
+
+#################################################################################################
     def train_gen(
         self,
         total_timesteps: Optional[int] = None,
@@ -415,6 +500,81 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             total_timesteps = self.gen_train_timesteps
         if learn_kwargs is None:
             learn_kwargs = {}
+
+            def rollout_model_and_populate_sac_buffer(
+                model_env: models.ModelEnv,
+                replay_buffer: mbrl_util.ReplayBuffer,
+                agent,
+                sac_buffer: mbrl_util.ReplayBuffer,
+                sac_samples_action: bool,
+                rollout_horizon: int,
+                batch_size: int,
+            ):
+
+                batch = replay_buffer.sample(batch_size)
+                initial_obs, *_ = cast(mbrl_types.TransitionBatch, batch).astuple()
+                model_state = model_env.reset(
+                    initial_obs_batch=cast(np.ndarray, initial_obs),
+                    return_as_np=True,
+                )
+                accum_dones = np.zeros(initial_obs.shape[0], dtype=bool)
+                obs = initial_obs
+                for i in range(rollout_horizon):
+                    action = agent.act(obs, sample=sac_samples_action, batched=True)
+                    pred_next_obs, pred_rewards, pred_dones, model_state = model_env.step(
+                        action, model_state, sample=True
+                    )
+                    sac_buffer.add_batch(
+                        obs[~accum_dones],
+                        action[~accum_dones],
+                        pred_next_obs[~accum_dones],
+                        pred_rewards[~accum_dones, 0],
+                        pred_dones[~accum_dones, 0],
+                    )
+                    obs = pred_next_obs
+                    accum_dones |= pred_dones.squeeze()
+
+
+            def evaluate(
+                env,
+                agent,
+                num_episodes: int,
+                video_recorder,
+            ) -> float:
+                avg_episode_reward = 0
+                for episode in range(num_episodes):
+                    obs = env.reset()
+                    # video_recorder.init(enabled=(episode == 0))
+                    done = False
+                    episode_reward = 0
+                    while not done:
+                        action = agent.act(obs)
+                        obs, reward, done, _ = env.step(action)
+                        # video_recorder.record(env)
+                        episode_reward += reward
+                    avg_episode_reward += episode_reward
+                return avg_episode_reward / num_episodes
+
+
+            def maybe_replace_sac_buffer(
+                sac_buffer: Optional[mbrl_util.ReplayBuffer],
+                obs_shape: Sequence[int],
+                act_shape: Sequence[int],
+                new_capacity: int,
+                seed: int,
+            ) -> mbrl_util.ReplayBuffer:
+                if sac_buffer is None or new_capacity != sac_buffer.capacity:
+                    if sac_buffer is None:
+                        rng = np.random.default_rng(seed=seed)
+                    else:
+                        rng = sac_buffer.rng
+                    new_buffer = mbrl_util.ReplayBuffer(new_capacity, obs_shape, act_shape, rng=rng)
+                    if sac_buffer is None:
+                        return new_buffer
+                    obs, action, next_obs, reward, done = sac_buffer.get_all().astuple()
+                    new_buffer.add_batch(obs, action, next_obs, reward, done)
+                    return new_buffer
+                return sac_buffer
             
  ######################## CHANGE FREE MODEL BASED TO MODEL BASED ########################################################
 #         with self.logger.accumulate_means("gen"):
@@ -425,52 +585,130 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
 #                 **learn_kwargs,
 #             )
 #             self._global_step += 1
-            
-            # Main PETS loop
-            all_rewards = [0]
-            for trial in range(2):
-                obs = self.venv_train.reset()    
-                self.gen_algo.reset()
 
-                done = False
-                total_reward = 0.0
-                steps_trial = 0
-                
-                while not done:
-                    # --------------- Model Training -----------------
-                    if steps_trial == 0:
-                        self.dynamics_model.update_normalizer(self.replay_buffer.get_all())  # update normalizer stats --> all the input arrays must have same number of dimensions, but the array at index 0 has 4 dimension(s) and the array at index 1 has 2 dimension(s)
+        silent = True
+        test_env = self.venv_train
+        video_recorder = None
+        rng = np.random.default_rng(seed=self.cfg.seed)
+        logger = None
 
-                        dataset_train, dataset_val = common_util.get_basic_buffer_iterators(
-                            self.replay_buffer,
-                            batch_size=self.cfg.overrides.model_batch_size,
-                            val_ratio=self.cfg.overrides.validation_ratio,
-                            ensemble_size=self.ensemble_size,
-                            shuffle_each_epoch=True,
-                            bootstrap_permutes=False,  # build bootstrap dataset using sampling with replacement
+        # --------------------- Training Loop ---------------------
+        rollout_batch_size = (
+            self.cfg.overrides.effective_model_rollouts_per_step * self.cfg.algorithm.freq_train_model
+        )
+        trains_per_epoch = int(
+            np.ceil(self.cfg.overrides.epoch_length / self.cfg.overrides.freq_train_model)
+        )
+        updates_made = 0
+        env_steps = 0
+        model_env = models.ModelEnv(
+            self.venv_train, self.dynamics_model, self.term_fn, None, generator=self.torch_generator
+        )
+        model_trainer = models.ModelTrainer(
+            self.dynamics_model,
+            optim_lr=self.cfg.overrides.model_lr,
+            weight_decay=self.cfg.overrides.model_wd,
+            logger=None if silent else logger,
+        )
+        best_eval_reward = -np.inf
+        epoch = 0
+        sac_buffer = None
+        while env_steps < self.cfg.overrides.num_steps:
+            rollout_length = int(
+                mbrl_util.math.truncated_linear( #util.math
+                    *(self.cfg.overrides.rollout_schedule + [epoch + 1])
+                )
+            )
+            sac_buffer_capacity = rollout_length * rollout_batch_size * trains_per_epoch
+            sac_buffer_capacity *= self.cfg.overrides.num_epochs_to_retain_sac_buffer
+            sac_buffer = maybe_replace_sac_buffer(
+                sac_buffer, self.venv_train.observation_space.shape , self.venv_train.action_space.shape, sac_buffer_capacity, seed=self.cfg.seed
+            )
+            obs, done = None, False
+            for steps_epoch in range(self.cfg.overrides.epoch_length):
+                if steps_epoch == 0 or done:
+                    obs, done = self.venv_train.reset(), False
+                # --- Doing env step and adding to model dataset ---
+                next_obs, reward, done, _ = mbrl_util.common.step_env_and_add_to_buffer(
+                    self.venv_train, obs, self.gen_algo, {}, self.replay_buffer
+                )
+
+                # --------------- Model Training -----------------
+                if (env_steps + 1) % self.cfg.overrides.freq_train_model == 0:
+                    mbrl_util.common.train_model_and_save_model_and_data(
+                        self.dynamics_model,
+                        model_trainer,
+                        self.cfg.overrides,
+                        self.replay_buffer,
+                        work_dir=self.work_dir,
+                    )
+
+                    # --------- Rollout new model and store imagined trajectories --------
+                    # Batch all rollouts for the next freq_train_model steps together
+                    rollout_model_and_populate_sac_buffer(
+                        model_env,
+                        self.replay_buffer,
+                        self.gen_algo,
+                        sac_buffer,
+                        self.cfg.algorithm.sac_samples_action,
+                        rollout_length,
+                        rollout_batch_size,
+                    )
+
+                    debug_mode = False ###########################
+                    if debug_mode:
+                        print(
+                            f"Epoch: {epoch}. "
+                            f"SAC buffer size: {len(sac_buffer)}. "
+                            f"Rollout length: {rollout_length}. "
+                            f"Steps: {env_steps}"
                         )
 
-                        self.model_trainer.train(
-                            dataset_train, 
-                            dataset_val=dataset_val, 
-                            num_epochs=2, 
-                            patience=2
+                # --------------- Agent Training -----------------
+                for _ in range(self.cfg.overrides.num_sac_updates_per_step):
+                    use_real_data = rng.random() < self.cfg.algorithm.real_data_ratio
+                    which_buffer = self.replay_buffer if use_real_data else sac_buffer
+                    if (env_steps + 1) % self.cfg.overrides.sac_updates_every_steps != 0 or len(
+                        which_buffer
+                    ) < self.cfg.overrides.sac_batch_size:
+                        break  # only update every once in a while
+
+                    self.gen_algo.sac_agent.update_parameters(
+                        which_buffer,
+                        self.cfg.overrides.sac_batch_size,
+                        updates_made,
+                        logger,
+                        reverse_mask=True,
+                    )
+                    updates_made += 1
+                    # if not silent and updates_made % cfg.log_frequency_agent == 0:
+                    #     logger.dump(updates_made, save=True)
+
+                # ------ Epoch ended (evaluate and save model) ------
+                if (env_steps + 1) % self.cfg.overrides.epoch_length == 0:
+                    avg_reward = evaluate(
+                        test_env, self.gen_algo, self.cfg.algorithm.num_eval_episodes, video_recorder
+                    )
+                    # logger.log_data(
+                    #     constants.RESULTS_LOG_NAME,
+                    #     {
+                    #         "epoch": epoch,
+                    #         "env_step": env_steps,
+                    #         "episode_reward": avg_reward,
+                    #         "rollout_length": rollout_length,
+                    #     },
+                    # )
+                    if avg_reward > best_eval_reward:
+                        # video_recorder.save(f"{epoch}.mp4")
+                        best_eval_reward = avg_reward
+                        self.gen_algo.sac_agent.save_checkpoint(
+                            ckpt_path=os.path.join(self.work_dir, "sac.pth")
                         )
+                    epoch += 1
 
-                    # --- Doing env step using the agent and adding to model dataset ---
-                    next_obs, reward, done, _ = common_util.step_env_and_add_to_buffer(
-                        self.venv_train, obs, self.gen_algo, {}, self.replay_buffer)
+                env_steps += 1
+                obs = next_obs
 
-                    
-
-                    obs = next_obs
-                    total_reward += reward
-                    steps_trial += 1
-
-                    if steps_trial == trial_length:
-                        break
-
-                all_rewards.append(total_reward)
 
  ######################## ###################################### ########################################################
 
@@ -636,8 +874,8 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
 
         # Calculate generator-policy log probabilities.
         with th.no_grad():
-            obs_th = th.as_tensor(obs, device=self.gen_algo.device)
-            acts_th = th.as_tensor(acts, device=self.gen_algo.device)
+            obs_th = th.as_tensor(obs, device="cpu") #from typing import Optional, Sequence, cast
+            acts_th = th.as_tensor(acts, device="cpu")
             log_policy_act_prob = self._get_log_policy_act_prob(obs_th, acts_th)
             if log_policy_act_prob is not None:
                 assert len(log_policy_act_prob) == n_samples
